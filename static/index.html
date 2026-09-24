@@ -225,6 +225,7 @@ th{color:var(--mut);font-weight:500}
       <button id="btnCalib" disabled title="对已保存方案做实测振动校准(只读, 影响系数法)">实测振动校准</button>
       <button id="btnLoading" disabled title="对已保存方案规划逐管安全装载次序(只读, 子集动态规划)">逐管安全装载</button>
       <button id="btnEvac" disabled title="对已保存方案做失效槽位应急迁移(只读, 精确枚举)">失效槽位应急迁移</button>
+      <button id="btnRecheck" disabled title="对已保存方案做现场装管复核(只读, 一对一匹配)">现场装管复核</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -442,6 +443,45 @@ th{color:var(--mut);font-weight:500}
       </div>
     </div>
     <div id="evacResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="recheckDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">现场装管复核</h2><div style="flex:1"></div>
+      <button id="btnCloseRecheck" class="ghost">关闭</button></div>
+    <div class="wc-note">按<b>启用槽</b>录入现场实际有管槽位及天平实测质量(精度 <b>0.01 g</b>, 至多
+      <b>12 份</b>), 并给出<b>统一允许偏差</b>。服务端只在质量差不超过偏差的边上求方案试管与
+      实测读数的<b>一对一匹配</b>, 以<b>总绝对质量差最小</b>为准(子集动态规划精确求解);
+      对每个实测槽汇总<b>所有最优匹配</b>可能对应的试管: 唯一时按原方案槽位标为
+      <b>正确 / 错槽</b>, 多解时标为<b>身份不确定</b>(不任取一解断言错放)。
+      读数数量与方案管数不等或不存在完整匹配时会明确说明原因。
+      复核为<b>只读</b>, 结果不保存、不覆盖原方案。</div>
+    <div id="recheckMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="min-width:190px">
+        <label>统一允许偏差 e (g), 必填的非负数</label>
+        <input id="rcTol" type="number" min="0" step="0.01" placeholder="例如 0.05">
+      </div>
+      <div style="align-self:flex-end" class="rowline">
+        <button id="btnRcPrefill" class="iconbtn" title="按方案摆放填入槽位与标称质量, 再按现场实测修改">按方案预填</button>
+        <button id="btnRcAdd" class="iconbtn">+ 添加读数</button>
+      </div>
+    </div>
+    <div style="max-height:230px;overflow:auto">
+      <table class="wc-table">
+        <thead><tr><th style="width:140px">实测槽位(启用槽)</th>
+          <th style="width:150px">实测质量(g, 0.01 精度)</th>
+          <th>方案参考</th><th style="width:44px"></th></tr></thead>
+        <tbody id="rcBody"></tbody>
+      </table>
+    </div>
+    <div class="rowline" style="margin-top:10px">
+      <button id="btnRcRun" class="primary">执行装管复核</button>
+      <span class="small" id="rcCount"></span>
+      <span class="small">只读操作, 不会修改或覆盖历史方案。</span>
+    </div>
+    <div id="recheckResult" style="margin-top:6px"></div>
   </div>
 </div>
 

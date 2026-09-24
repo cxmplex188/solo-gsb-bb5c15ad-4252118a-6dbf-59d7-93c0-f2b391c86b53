@@ -793,6 +793,132 @@ assert call("GET", f"/api/plan/{evid3}")["result"]["metrics"]["u1_mag_g_mm"] == 
     recv3["result"]["metrics"]["u1_mag_g_mm"]
 print("slot-evacuation validation/read-only OK")
 
+# ---- 现场装管复核(只读, 子集 DP 最小总绝对质量差匹配) ----
+def rc_call(plan_id, readings, tol):
+    found = find("POST", f"/api/plan/{plan_id}/tube-recheck")
+    fn, args = (found if isinstance(found, tuple) else (found, ()))
+    def _reading(s, m):
+        o = types.SimpleNamespace(slot=int(s), mass=float(m))
+        o.model_dump = lambda: {"slot": o.slot, "mass": o.mass}
+        return o
+    req = types.SimpleNamespace(
+        readings=[_reading(s, m) for s, m in readings],
+        tolerance_g=float(tol),
+    )
+    return fn(*args, req)
+
+# 确定性方案: 四支不同质量试管全部锁定在槽 0/3/6/9(槽 2/11 禁用)
+rc_body = dict(ev_body)
+rc_body["name"] = "装管复核方案"
+rc_body["slots"] = [{"index": i, "angle": i * 30, "enabled": i not in (2, 11)}
+                    for i in range(12)]
+rc_body["tubes"] = [
+    {"id": 1, "mass": 50, "locked": True, "slot": 0},
+    {"id": 2, "mass": 51, "locked": True, "slot": 3},
+    {"id": 3, "mass": 52, "locked": True, "slot": 6},
+    {"id": 4, "mass": 53, "locked": True, "slot": 9},
+]
+rec_rc = call("POST", "/api/plan", rc_body)
+rcid = rec_rc["id"]
+# 全部按方案装管且读数精确: 唯一匹配, 全部正确
+rc_ok = rc_call(rcid, [(0, 50.0), (3, 51.0), (6, 52.0), (9, 53.0)], 0.05)
+assert rc_ok["complete"] is True and rc_ok["optimal_matching_count"] == 1
+assert [x["status"] for x in rc_ok["readings"]] == ["correct"] * 4
+assert rc_ok["summary"] == {"correct": 4, "wrong_slot": 0, "uncertain": 0}
+assert abs(rc_ok["total_abs_deviation_g"]) < 1e-9
+# 管 1/2 装槽互换(读数仍在原槽): 唯一匹配, 槽 0/3 错槽, 槽 6/9 正确
+rc_sw = rc_call(rcid, [(0, 51.0), (3, 50.0), (6, 52.0), (9, 53.0)], 0.05)
+st = {x["slot"]: x for x in rc_sw["readings"]}
+assert st[0]["status"] == "wrong_slot" and st[0]["matched_tube_id"] == 2
+assert st[3]["status"] == "wrong_slot" and st[3]["matched_tube_id"] == 1
+assert st[6]["status"] == "correct" and st[9]["status"] == "correct"
+assert rc_sw["summary"]["wrong_slot"] == 2
+tt = {x["tube_id"]: x for x in rc_sw["tubes"]}
+assert tt[1]["candidate_slots"] == [3] and tt[2]["candidate_slots"] == [0]
+# 读数数量不等: 说明原因, 不做匹配
+rc_ne = rc_call(rcid, [(0, 50.0), (3, 51.0)], 0.05)
+assert rc_ne["complete"] is False and "不等" in rc_ne["reason"]
+# 不存在完整匹配: 管 2(51 g)在偏差内无兼容读数, 最多匹配 3/4 对
+rc_no = rc_call(rcid, [(0, 50.0), (3, 50.0), (6, 52.0), (9, 53.0)], 0.05)
+assert rc_no["complete"] is False and rc_no["max_matched_pairs"] == 3
+assert [t["tube_id"] for t in rc_no["tubes_without_candidate"]] == [2]
+assert "不存在完整的一对一匹配" in rc_no["reason"]
+print("tube-recheck correct/wrong-slot/incomplete OK")
+
+# 等质量方案: 最优匹配不唯一 -> 身份不确定, 不得断言错放
+rc2_body = dict(ev_body)
+rc2_body["name"] = "装管复核等质量方案"
+rc2_body["tubes"] = [
+    {"id": 1, "mass": 50, "locked": True, "slot": 0},
+    {"id": 2, "mass": 50, "locked": True, "slot": 6},
+]
+rec_rc2 = call("POST", "/api/plan", rc2_body)
+rc_unc = rc_call(rec_rc2["id"], [(0, 50.0), (6, 50.0)], 0.05)
+assert rc_unc["complete"] is True and rc_unc["optimal_matching_count"] == 2
+assert [x["status"] for x in rc_unc["readings"]] == ["uncertain"] * 2
+assert all(x["matched_tube_id"] is None for x in rc_unc["readings"])
+assert "身份不确定" in rc_unc["reason"]
+# 与独立暴力枚举对照(全排列求最小总差 + 候选集合)
+def _brute_recheck(plan, readings, tol):
+    tubes = sorted(
+        ((p["tube_id"], p["slot"], p["mass"])
+         for p in plan["result"]["placements"] if p["slot"] is not None),
+        key=lambda x: x[0])
+    rd = sorted(readings)
+    n = len(tubes)
+    best = None; cnt = 0; cand = [set() for _ in range(n)]
+    for perm in _it.permutations(range(n)):
+        tot = 0.0; ok = True
+        for k in range(n):
+            d = abs(tubes[k][2] - rd[perm[k]][1])
+            if d > tol + 1e-9:
+                ok = False; break
+            tot += d
+        if not ok:
+            continue
+        if best is None or tot < best - 1e-9 * max(1.0, best):
+            best, cnt = tot, 1
+            cand = [set() for _ in range(n)]
+            for k in range(n):
+                cand[perm[k]].add(tubes[k][0])
+        elif tot <= best + 1e-9 * max(1.0, best):
+            cnt += 1
+            for k in range(n):
+                cand[perm[k]].add(tubes[k][0])
+    return best, cnt, cand
+plan2 = call("GET", f"/api/plan/{rcid}")
+_rd = [(0, 50.01), (3, 51.02), (6, 51.99), (9, 53.0)]
+rc_rb = rc_call(rcid, _rd, 0.05)
+b_best, b_cnt, b_cand = _brute_recheck(plan2, _rd, 0.05)
+assert abs(rc_rb["total_abs_deviation_g"] - b_best) < 1e-9
+assert rc_rb["optimal_matching_count"] == b_cnt
+for row in rc_rb["readings"]:
+    j = [r[0] for r in sorted(_rd)].index(row["slot"])
+    assert {c["tube_id"] for c in row["candidates"]} == b_cand[j]
+print("tube-recheck brute-force cross-check OK")
+
+# 校验错误: 精度不足 / 禁用槽 / 槽位重复 / 13 份读数 / 负偏差 -> 400; 方案不存在 -> 404
+for bad_rc in (
+    ([(0, 50.005), (3, 51.0), (6, 52.0), (9, 53.0)], 0.05),   # 非 0.01 整数倍
+    ([(0, 50.0), (3, 51.0), (6, 52.0), (2, 53.0)], 0.05),     # 槽 2 为禁用槽
+    ([(0, 50.0), (0, 51.0), (6, 52.0), (9, 53.0)], 0.05),     # 槽位重复
+    ([(i, 50.0) for i in range(13)], 0.05),                   # 超过 12 份
+    ([(0, 50.0), (3, 51.0), (6, 52.0), (9, 53.0)], -0.1),     # 负偏差
+):
+    try:
+        rc_call(rcid, *bad_rc); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, (bad_rc, e)
+try:
+    rc_call(999, [(0, 50.0)], 0.05); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 只读: 复核后原方案指标不变
+assert call("GET", f"/api/plan/{rcid}")["result"]["metrics"]["u1_mag_g_mm"] == \
+    rec_rc["result"]["metrics"]["u1_mag_g_mm"]
+print("tube-recheck validation/read-only OK")
+
+
 # ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
 import itertools as _itx
 

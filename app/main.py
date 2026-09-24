@@ -21,6 +21,7 @@ from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
 from .evacuation import plan_slot_evacuation
 from .loading import plan_loading_sequence
+from .recheck import recheck_tube_loading
 from .weighing import worst_case_u1
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -137,6 +138,20 @@ class SlotEvacuationRequest(BaseModel):
     u1_limit_g_mm: float = Field(ge=0)
     # 最多可移动管数(0~3, 控制精确枚举的搜索规模)
     max_moves: int = Field(ge=0, le=3)
+
+
+class RecheckReadingIn(BaseModel):
+    # 实际有管的启用槽位与天平实测质量(g); 有限性与 0.01 g 读数精度
+    # 由复核逻辑统一校验并返回 400(与振动校准一致, 避免 pydantic 回显 NaN/Inf)
+    slot: int
+    mass: float = Field(gt=0)
+
+
+class TubeRecheckRequest(BaseModel):
+    # 现场实测读数(1~12 份): 实际有管的启用槽位 + 实测质量(0.01 g 精度)
+    readings: list[RecheckReadingIn] = Field(min_length=1, max_length=12)
+    # 统一允许偏差(g), 必填的非负数; 只有质量差不超过该偏差的边上才允许匹配
+    tolerance_g: float = Field(ge=0)
 
 
 class PlanRequest(BaseModel):
@@ -502,6 +517,28 @@ def slot_evacuation(plan_id: int, req: SlotEvacuationRequest) -> dict[str, Any]:
             failed_slots=list(req.failed_slots),
             u1_limit_g_mm=req.u1_limit_g_mm,
             max_moves=req.max_moves,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/plan/{plan_id}/tube-recheck")
+def tube_recheck(plan_id: int, req: TubeRecheckRequest) -> dict[str, Any]:
+    """对已保存方案做现场装管复核(只读): 实测读数与方案试管的一对一匹配。
+
+    按启用槽录入实际有管槽位及天平实测质量(0.01 g 精度, 至多 12 份)与
+    统一允许偏差; 服务端只在质量差不超过偏差的边上求一对一匹配, 用子集
+    动态规划精确求总绝对质量差最小的最优匹配, 并对每个实测槽汇总所有
+    最优匹配可能对应的试管: 唯一时按原方案槽位标为正确或错槽, 多解时
+    标为身份不确定(不任取一解断言错放)。读数数量与方案管数不等或不
+    存在完整匹配时明确说明原因。结果不保存、不覆盖原方案。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return recheck_tube_loading(
+            plan,
+            readings=[r.model_dump() for r in req.readings],
+            tolerance_g=req.tolerance_g,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
