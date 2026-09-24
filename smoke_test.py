@@ -793,6 +793,146 @@ assert call("GET", f"/api/plan/{evid3}")["result"]["metrics"]["u1_mag_g_mm"] == 
     recv3["result"]["metrics"]["u1_mag_g_mm"]
 print("slot-evacuation validation/read-only OK")
 
+# ---- 现场装管复核(只读, 子集 DP 一对一质量匹配; 枚举全部最优解) ----
+import itertools as _it_rc
+def rc_route(plan_id):
+    found = find("POST", f"/api/plan/{plan_id}/loading-recheck")
+    return (found if isinstance(found, tuple) else (found, ()))
+def rc_call(plan_id, readings, tol):
+    fn, args = rc_route(plan_id)
+    req = types.SimpleNamespace(
+        readings=[types.SimpleNamespace(slot=int(r["slot"]),
+                                        measured_mass_g=float(r["measured_mass_g"]))
+                  for r in readings],
+        tolerance_g=float(tol))
+    return fn(*args, req)
+def rc_brute(placements, readings, tol):
+    """全排列参考: (最优成本, 条数, {实测槽: 候选管集合}); 无完全匹配返回 None。"""
+    n = len(placements)
+    if len(readings) != n:
+        return None
+    best = None; cnt = 0
+    cand = {int(r["slot"]): set() for r in readings}
+    for perm in _it_rc.permutations(range(n)):
+        total = 0.0; pairs = []; ok = True
+        for i, j in enumerate(perm):
+            d = abs(float(readings[i]["measured_mass_g"]) - float(placements[j]["mass"]))
+            if d > tol + 1e-9 * max(1.0, tol):
+                ok = False; break
+            total += d
+            pairs.append((int(readings[i]["slot"]), int(placements[j]["tube_id"])))
+        if not ok:
+            continue
+        if best is None or total < best - 1e-9 * max(1.0, best):
+            best, cnt = total, 1
+            cand = {int(r["slot"]): set() for r in readings}
+            for s, t in pairs: cand[s].add(t)
+        elif total <= best + 1e-9 * max(1.0, best):
+            cnt += 1
+            for s, t in pairs: cand[s].add(t)
+    return best, cnt, cand
+
+# 专用小方案: 2 支等质量管(槽 0/6) + 2 支异质量管(槽 3/9)
+rc_body = {"name": "复核方案", "slot_count": 12,
+           "slots": [{"index": i, "angle": i * 30, "enabled": True} for i in range(12)],
+           "tubes": [{"id": 1, "mass": 50}, {"id": 2, "mass": 50},
+                     {"id": 3, "mass": 51}, {"id": 4, "mass": 49}],
+           "radius_mm": 100, "rpm": 4000, "restarts": 4, "chain_steps": 800}
+rc_rec = call("POST", "/api/plan", rc_body)
+rc_id = rc_rec["id"]
+rc_p = sorted(((p["slot"], p) for p in rc_rec["result"]["placements"]), key=lambda x: x[0])
+rc_pl = [p for _, p in rc_p]
+rc_slots = [s for s, _ in rc_p]
+rc_slot_of = {int(p["tube_id"]): int(p["slot"]) for p in rc_pl}
+
+# ① 全对: 各槽读回标称质量 —— 等质量的两支即使在本位也无法区分(身份不确定),
+#    异质量的两支唯一匹配且为原槽(正确); 成本 0 且不允许出现错槽结论
+ok_reads = [{"slot": p["slot"], "measured_mass_g": p["mass"]} for p in rc_pl]
+rc_ok = rc_call(rc_id, ok_reads, 0.05)
+assert rc_ok["matchable"] is True and rc_ok["all_correct"] is False
+assert rc_ok["counts"] == {"correct": 2, "wrong_slot": 0, "uncertain": 2}
+assert rc_ok["optimal_total_abs_diff_g"] == 0.0
+# 全异质量方案: 各槽读回标称质量必须全部唯一判正确
+rc_body2 = dict(rc_body)
+rc_body2["name"] = "复核方案2"
+rc_body2["tubes"] = [{"id": 1, "mass": 48}, {"id": 2, "mass": 50},
+                     {"id": 3, "mass": 51}, {"id": 4, "mass": 49}]
+rc_rec2 = call("POST", "/api/plan", rc_body2)
+rc_id2 = rc_rec2["id"]
+rc_pl2 = sorted(rc_rec2["result"]["placements"], key=lambda p: p["slot"])
+ok_reads2 = [{"slot": p["slot"], "measured_mass_g": p["mass"]} for p in rc_pl2]
+rc_ok2 = rc_call(rc_id2, ok_reads2, 0.05)
+assert rc_ok2["matchable"] is True and rc_ok2["all_correct"] is True
+assert rc_ok2["counts"] == {"correct": 4, "wrong_slot": 0, "uncertain": 0}
+
+# ② 等质量两管读数不变(互换不可区分) -> 两槽身份不确定; 异质量两管对调 -> 错槽
+swap_reads = [dict(r) for r in ok_reads]
+# 找到 51g(管3) 与 49g(管4) 的两行并对调实测质量
+i51 = next(i for i, r in enumerate(swap_reads)
+           if r["slot"] == rc_slot_of[3])
+i49 = next(i for i, r in enumerate(swap_reads)
+           if r["slot"] == rc_slot_of[4])
+swap_reads[i51]["measured_mass_g"], swap_reads[i49]["measured_mass_g"] = 49.0, 51.0
+rc_sw = rc_call(rc_id, swap_reads, 0.05)
+assert rc_sw["matchable"] is True
+assert rc_sw["counts"]["uncertain"] == 2 and rc_sw["counts"]["wrong_slot"] == 2
+v = {s["slot"]: s for s in rc_sw["slots"]}
+assert {c["tube_id"] for c in v[rc_slot_of[1]]["candidates"]} == {1, 2}
+assert {c["tube_id"] for c in v[rc_slot_of[2]]["candidates"]} == {1, 2}
+assert [c["tube_id"] for c in v[rc_slot_of[3]]["candidates"]] == [4]
+assert [c["tube_id"] for c in v[rc_slot_of[4]]["candidates"]] == [3]
+assert v[rc_slot_of[3]]["verdict"] == "wrong_slot"
+# 暴力交叉验证最优成本/条数/候选集合
+_b, _n, _cand = rc_brute(rc_pl, swap_reads, 0.05)
+assert abs(rc_sw["optimal_total_abs_diff_g"] - round(_b, 2)) < 1e-9
+assert rc_sw["optimal_match_count"] == _n
+for s in rc_sw["slots"]:
+    assert {c["tube_id"] for c in s["candidates"]} == _cand[s["slot"]]
+
+# ③ 读数少 1 条 -> matchable=false 并说明, 给最大配对数对照
+rc_few = rc_call(rc_id, ok_reads[:3], 0.05)
+assert rc_few["matchable"] is False and "少于方案管数" in rc_few["reason"]
+assert rc_few["best_effort"]["matched_count"] == 3
+assert len(rc_few["best_effort"]["unmatched_tubes"]) == 1
+
+# ④ 偏差内无完全匹配 -> matchable=false, reason 明确
+bad_reads = [{"slot": p["slot"], "measured_mass_g": 90.0} for p in rc_pl]
+rc_no = rc_call(rc_id, bad_reads, 0.05)
+assert rc_no["matchable"] is False and "不存在一对一完全匹配" in rc_no["reason"]
+assert rc_no["best_effort"]["matched_count"] == 0
+
+# ⑤ 边界偏差(含等号)、0.01 精度量化
+rc_edge = rc_call(rc_id, [{"slot": rc_slot_of[1], "measured_mass_g": 50.5}], 0.5)
+# 单读数量不等(n=4, k=1) -> 不匹配但成本对照中该边可行
+assert rc_edge["matchable"] is False and rc_edge["best_effort"]["matched_count"] == 1
+rc_q = rc_call(rc_id, [
+    dict(r, measured_mass_g=float(r["measured_mass_g"]) + 0.004) for r in ok_reads], 0.05)
+assert all(r["quantized_to_0_01g"] for r in rc_q["readings"])
+
+# ⑥ 校验错误 -> 400; 方案不存在 -> 404
+try:
+    rc_call(rc_id, [ok_reads[0], ok_reads[0]], 0.05); raise SystemExit("should 400 dup")
+except main.HTTPException as e:
+    assert e.status_code == 400
+try:
+    rc_call(rc_id, [{"slot": 99, "measured_mass_g": 50.0}] * 4, 0.05)
+    raise SystemExit("should 400 missing slot")
+except main.HTTPException as e:
+    assert e.status_code == 400
+try:
+    rc_call(rc_id, ok_reads, -0.01); raise SystemExit("should 400 neg tol")
+except main.HTTPException as e:
+    assert e.status_code == 400
+try:
+    rc_call(99999, ok_reads, 0.05); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+
+# 只读: 复核后原方案不变
+assert call("GET", f"/api/plan/{rc_id}")["result"]["metrics"]["u1_mag_g_mm"] == \
+    rc_rec["result"]["metrics"]["u1_mag_g_mm"]
+print("loading-recheck correct/uncertain/wrong/mismatch/validation/read-only OK")
+
 # ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
 import itertools as _itx
 

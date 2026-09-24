@@ -328,11 +328,17 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核/振动校准/逐管装载/应急迁移只针对已保存方案: 未保存(草稿)时禁用
-  $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
-  $("btnCalib").disabled = !(record.id !== null && record.id !== undefined);
-  $("btnLoading").disabled = !(record.id !== null && record.id !== undefined);
-  $("btnEvac").disabled = !(record.id !== null && record.id !== undefined);
+  // 误差校核/振动校准/逐管装载/现场复核/应急迁移只针对已保存方案: 未保存(草稿)时禁用
+  const saved = record.id !== null && record.id !== undefined;
+  const placedCount = r.placements.filter((p) => p.slot !== null && p.slot !== undefined).length;
+  $("btnWeighing").disabled = !saved;
+  $("btnCalib").disabled = !saved;
+  $("btnLoading").disabled = !saved;
+  $("btnRecheck").disabled = !saved || placedCount === 0 || placedCount > 12;
+  $("btnRecheck").title = placedCount > 12
+    ? `方案有 ${placedCount} 支管, 超过现场装管复核上限 12 管`
+    : "对已保存方案做现场装管复核(只读, 一对一质量匹配)";
+  $("btnEvac").disabled = !saved;
 
   drawRotor(r);
   renderPairs(r);
@@ -600,6 +606,7 @@ async function renderHistory() {
         <button class="iconbtn" data-a="weigh">误差校核</button>
         <button class="iconbtn" data-a="calib">振动校准</button>
         <button class="iconbtn" data-a="loadseq">安全装载</button>
+        <button class="iconbtn" data-a="recheck">装管复核</button>
         <button class="iconbtn" data-a="evac">应急迁移</button>
         <button class="iconbtn" data-a="export">导出</button>
         <button class="iconbtn" data-a="del">删除</button>
@@ -620,6 +627,7 @@ async function renderHistory() {
     d.querySelector('[data-a="weigh"]').onclick = () => openWeighingDialog(it.id);
     d.querySelector('[data-a="calib"]').onclick = () => openCalibDialog(it.id);
     d.querySelector('[data-a="loadseq"]').onclick = () => openLoadingDialog(it.id);
+    d.querySelector('[data-a="recheck"]').onclick = () => openRecheckDialog(it.id);
     d.querySelector('[data-a="evac"]').onclick = () => openEvacDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
@@ -1315,6 +1323,226 @@ $("btnLoading").onclick = () => {
   }
 };
 $("btnCloseLoading").onclick = () => $("loadingDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 现场装管复核(只读, 基于已保存方案; 子集 DP 一对一质量匹配, 枚举全部最优解)
+// ---------------------------------------------------------------------------
+const rcState = { planId: null, plan: null, rows: [], enabledSlots: [] };
+
+async function openRecheckDialog(id) {
+  $("btnRecheck")?.blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    const placed = data.result.placements.filter((p) => p.slot !== null && p.slot !== undefined);
+    if (!placed.length) { toast("该方案没有已放置的试管, 无法复核。", true); return; }
+    if (placed.length > 12) { toast(`方案有 ${placed.length} 支管, 超过现场装管复核上限 12 管。`, true); return; }
+    rcState.planId = id;
+    rcState.plan = data;
+    rcState.enabledSlots = data.result.slot_state
+      .filter((s) => s.enabled).map((s) => ({ slot: s.slot, angle: s.angle }))
+      .sort((a, b) => a.slot - b.slot);
+    // 默认按方案摆放槽位生成读数行(实测质量预填标称值, 操作员可改)
+    rcState.rows = placed
+      .map((p) => ({ slot: p.slot, mass: Number(p.mass).toFixed(2) }))
+      .sort((a, b) => a.slot - b.slot);
+    $("recheckMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${rcState.enabledSlots.length} 个启用槽 ·
+       方案管数 <b>${placed.length}</b> · 标称 |U₁|=${fmt(data.result.metrics.u1_mag_g_mm)} g·mm`;
+    $("rcTol").value = "0.05";
+    $("rcUniform").value = "";
+    $("recheckResult").innerHTML = "";
+    renderRcRows();
+    $("recheckDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function renderRcRows() {
+  const tb = $("rcRowBody");
+  tb.innerHTML = "";
+  const slotOpts = (sel) => rcState.enabledSlots
+    .map((s) => `<option value="${s.slot}" ${sel === s.slot ? "selected" : ""}>#${s.slot} (${fmt(s.angle, 0)}°)</option>`)
+    .join("");
+  rcState.rows.forEach((r, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><select data-f="slot">${slotOpts(r.slot)}</select></td>
+      <td><input type="number" min="0" step="0.01" data-f="mass" value="${r.mass}" style="width:140px"></td>
+      <td class="small" data-plan></td>
+      <td style="text-align:right"><button class="iconbtn" data-act="del">删</button></td>`;
+    const fillPlan = () => {
+      const p = rcState.plan.result.placements.find((x) => x.slot === r.slot && x.slot !== null);
+      tr.querySelector("[data-plan]").innerHTML = p
+        ? `试管 <b>${p.tube_id}</b>, 标称 ${fmt(p.mass, 2)} g (${fmt(p.angle, 1)}°)`
+        : '<span class="muted">空启用槽(方案无管)</span>';
+    };
+    tr.addEventListener("input", onEdit);
+    tr.addEventListener("change", onEdit);
+    function onEdit(e) {
+      const f = e.target.dataset.f;
+      if (f === "slot") { r.slot = parseInt(e.target.value, 10); fillPlan(); }
+      if (f === "mass") r.mass = e.target.value;
+    }
+    tr.querySelector('[data-act="del"]').onclick = () => { rcState.rows.splice(i, 1); renderRcRows(); };
+    fillPlan();
+    tb.appendChild(tr);
+  });
+  $("rcRowCount").textContent = `共 ${rcState.rows.length} / 12 管`;
+  $("btnRcAddRow").disabled = rcState.rows.length >= 12;
+}
+
+$("btnRcAddRow").onclick = () => {
+  if (rcState.rows.length >= 12) { toast("现场读数最多 12 管。", true); return; }
+  const used = new Set(rcState.rows.map((r) => r.slot));
+  const free = rcState.enabledSlots.find((s) => !used.has(s.slot));
+  if (!free) { toast("没有更多可录入的启用槽。", true); return; }
+  rcState.rows.push({ slot: free.slot, mass: "50.00" });
+  renderRcRows();
+};
+
+$("btnRcApplyUniform").onclick = () => {
+  const v = parseFloat($("rcUniform").value);
+  if (!(v > 0) || !Number.isFinite(v)) { toast("请输入大于零的统一实测质量。", true); return; }
+  rcState.rows.forEach((r) => { r.mass = v.toFixed(2); });
+  renderRcRows();
+};
+
+$("btnRcRun").onclick = async () => {
+  const btn = $("btnRcRun");
+  btn.disabled = true;
+  try {
+    const tol = parseFloat($("rcTol").value);
+    if (!(tol >= 0) || !Number.isFinite(tol)) { toast("统一允许偏差必须为非负有限数。", true); return; }
+    if (!rcState.rows.length) { toast("请至少录入一个实测槽位。", true); return; }
+    const seen = new Set();
+    const readings = [];
+    for (const r of rcState.rows) {
+      if (seen.has(r.slot)) { toast(`实测槽位 #${r.slot} 重复。`, true); return; }
+      seen.add(r.slot);
+      const m = parseFloat(r.mass);
+      if (!(m > 0) || !Number.isFinite(m)) { toast(`槽位 #${r.slot} 的实测质量必须为大于零的有限数。`, true); return; }
+      readings.push({ slot: r.slot, measured_mass_g: Math.round(m * 100) / 100 });
+    }
+    const resp = await fetch(`/api/plan/${rcState.planId}/loading-recheck`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ readings, tolerance_g: tol }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "现场装管复核失败");
+    renderRecheckResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+const rcVerdictMap = {
+  correct: ["正确", "wc-ok"],
+  wrong_slot: ["错槽", "wc-bad"],
+  uncertain: ["身份不确定", "cmp-warn"],
+};
+
+function renderRecheckResult(d) {
+  const box = $("recheckResult");
+  if (!d.matchable) {
+    const be = d.best_effort;
+    const pairRows = be.pairs.map((p) => `<tr>
+        <td>#${p.slot} <span class="small">(${fmt(p.angle_deg, 1)}°)</span></td>
+        <td>${fmt(p.measured_mass_g, 2)}</td>
+        <td>${p.tube_id}</td>
+        <td>#${p.planned_slot}</td>
+        <td style="text-align:right">${fmt(p.abs_mass_diff_g, 2)}</td>
+      </tr>`).join("");
+    const unmatchedR = be.unmatched_readings.map((u) =>
+      `#${u.slot}(${fmt(u.measured_mass_g, 2)}g)`).join("、") || "无";
+    const unmatchedT = be.unmatched_tubes.map((u) =>
+      `管${u.tube_id}@#${u.planned_slot}(${fmt(u.nominal_mass_g, 2)}g)`).join("、") || "无";
+    box.innerHTML = `
+      <div class="wc-bad">✘ <b>无法完成复核判定</b>: ${d.reason}</div>
+      <div class="wc-note">最大配对数对照匹配: <b>${be.matched_count}</b> 对,
+        对照总绝对质量差 ${fmt(be.total_abs_diff_g, 2)} g(仅诊断参考, 不得据此断言错放)。
+        未匹配读数: ${unmatchedR}; 未匹配方案管: ${unmatchedT}。</div>
+      ${be.pairs.length ? `<table class="cmp-table wc-table">
+        <thead><tr><th>实测槽</th><th>实测质量(g)</th><th>对照管号</th><th>该管方案槽</th>
+        <th style="text-align:right">|质量差|</th></tr></thead><tbody>${pairRows}</tbody></table>` : ""}
+      <div class="small" style="margin-top:6px">方案 #${d.plan.id} 未被修改。</div>`;
+    return;
+  }
+
+  const c = d.counts;
+  let head;
+  if (d.all_correct) {
+    head = `<div class="wc-ok">✔ <b>现场装管与方案一致</b>: 全部 ${d.plan_tube_count} 个实测槽均唯一匹配到
+      其原方案槽位上的试管。最优总绝对质量差 <b>${fmt(d.optimal_total_abs_diff_g, 2)}</b> g
+      (允许偏差 ${fmt(d.tolerance_g, 2)} g)。</div>`;
+  } else if (c.wrong_slot === 0) {
+    head = `<div class="cmp-warn">⚠ <b>${c.correct} 槽正确 · ${c.uncertain} 槽身份不确定</b>:
+      不存在可唯一确定的错槽, 但有 ${c.uncertain} 个槽存在多个总质量差同为最小的一对一匹配,
+      <b>不能任取一解断言错放</b>, 请结合管号标签等额外信息人工复核。</div>`;
+  } else {
+    head = `<div class="wc-bad">✘ <b>${c.correct} 槽正确 · ${c.wrong_slot} 槽错槽 · ${c.uncertain} 槽身份不确定</b>:
+      错槽内的实测管唯一对应到其他方案槽位的试管; 身份不确定的槽不得据任一最优解下错放结论。</div>`;
+  }
+  const tie = d.tie_broken
+    ? `达到最小总绝对质量差(${fmt(d.optimal_total_abs_diff_g, 2)} g)的一对一完全匹配共
+       <b>${d.optimal_match_count}</b> 个, 结论已汇总全部最优匹配的候选。`
+    : "最优完全匹配唯一。";
+
+  const rows = d.slots.map((s) => {
+    const [txt, cls] = rcVerdictMap[s.verdict];
+    const cand = s.candidates.map((x) =>
+      `管 ${x.tube_id}(方案槽 #${x.planned_slot}, 标称 ${fmt(x.nominal_mass_g, 2)}g,
+       差 ${fmt(x.abs_mass_diff_g, 2)}g)`).join("<br>");
+    const bg = s.verdict === "wrong_slot" ? "#3d141455"
+      : s.verdict === "uncertain" ? "#3a2a1255" : "#10331f33";
+    return `<tr style="background:${bg}">
+      <td>#${s.slot} <span class="small">(${fmt(s.angle_deg, 1)}°)</span></td>
+      <td><b>${fmt(s.measured_mass_g, 2)}</b></td>
+      <td>${s.candidate_count}</td>
+      <td class="small">${cand}</td>
+      <td style="text-align:center"><span class="status-tag ${
+        s.verdict === "correct" ? "st-correct" : s.verdict === "wrong_slot" ? "st-wrong" : "st-uncertain"
+      }">${txt}</span></td>
+    </tr>`;
+  }).join("");
+
+  const repRows = d.representative_match.map((p) => `<tr>
+      <td>#${p.slot}</td><td>${fmt(p.measured_mass_g, 2)}</td>
+      <td>${p.tube_id} <span class="small">(方案槽 #${p.planned_slot})</span></td>
+      <td style="text-align:right">${p.mass_diff_g >= 0 ? "+" : "−"}${fmt(Math.abs(p.mass_diff_g), 2)}</td>
+    </tr>`).join("");
+
+  box.innerHTML = `
+    ${head}
+    <div class="wc-note">${tie} ${d.summary}</div>
+    <table class="cmp-table wc-table">
+      <thead><tr><th>实测槽 / 角度</th><th>实测质量(g)</th><th>候选数</th>
+        <th>全部最优匹配中可能对应的试管</th><th style="text-align:center">判定</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <h2 style="font-size:13px;margin:10px 0 6px">一个代表性最优完全匹配
+      <span class="small">(仅展示; ${d.representative_warning})</span></h2>
+    <table class="cmp-table wc-table">
+      <thead><tr><th>实测槽</th><th>实测质量(g)</th><th>匹配管号</th>
+        <th style="text-align:right">质量差(g)</th></tr></thead>
+      <tbody>${repRows}</tbody>
+    </table>
+    <div class="small" style="margin-top:6px">算法: ${d.method}。${d.note} 方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnRecheck").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openRecheckDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseRecheck").onclick = () => $("recheckDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 失效槽位应急迁移(只读, 基于已保存方案; 按移动数分层精确枚举)

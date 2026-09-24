@@ -126,6 +126,9 @@ th{color:var(--mut);font-weight:500}
 .st-removed{color:var(--bad);border-color:var(--bad)}
 .st-moved{color:var(--warn);border-color:var(--warn)}
 .st-unchanged{color:var(--mut)}
+.st-correct{color:var(--acc2);border-color:var(--acc2);background:#10331f55;font-weight:600}
+.st-wrong{color:#fecaca;border-color:var(--bad);background:#3d141455;font-weight:600}
+.st-uncertain{color:#fde68a;border-color:var(--warn);background:#3a2a1255;font-weight:600}
 .diff-group-title{font-size:12.5px;color:var(--warn);margin:10px 0 2px;font-weight:600}
 @media(max-width:1080px){.wrap{grid-template-columns:1fr}.result{grid-template-columns:1fr}.cmp-grid{grid-template-columns:1fr}}
 </style>
@@ -224,6 +227,7 @@ th{color:var(--mut);font-weight:500}
       <button id="btnWeighing" disabled title="对已保存方案做称重误差校核(只读)">称重误差校核</button>
       <button id="btnCalib" disabled title="对已保存方案做实测振动校准(只读, 影响系数法)">实测振动校准</button>
       <button id="btnLoading" disabled title="对已保存方案规划逐管安全装载次序(只读, 子集动态规划)">逐管安全装载</button>
+      <button id="btnRecheck" disabled title="对已保存方案做现场装管复核(只读, 一对一质量匹配)">现场装管复核</button>
       <button id="btnEvac" disabled title="对已保存方案做失效槽位应急迁移(只读, 精确枚举)">失效槽位应急迁移</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
@@ -411,6 +415,51 @@ th{color:var(--mut);font-weight:500}
       </div>
     </div>
     <div id="loadingResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="recheckDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">现场装管复核</h2><div style="flex:1"></div>
+      <button id="btnCloseRecheck" class="ghost">关闭</button></div>
+    <div class="wc-note">按<b>启用槽</b>录入现场实际有管的槽位及该管<b>实测质量(精度 0.01 g)</b>,
+      并填写<b>统一允许偏差 Δ(g)</b>。后端只在 |实测质量 − 标称质量| ≤ Δ 的边上做<b>一对一</b>匹配,
+      用子集动态规划(2ⁿ, n≤12)取<b>总绝对质量差最小</b>的完全匹配, 并枚举<b>全部最优匹配</b>:
+      每个实测槽唯一对应原方案槽位的管→<b>正确</b>; 唯一对应其他方案槽位的管→<b>错槽</b>;
+      存在多个同优匹配→<b>身份不确定</b>(不会任取一解断言错放)。读数数量与方案管数不等、
+      或偏差内不存在完全匹配时只说明原因并给对照匹配。复核为<b>只读</b>, 不保存、不修改原方案。</div>
+    <div id="recheckMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="flex:1;min-width:200px">
+        <label>统一允许偏差 Δ (g), 非负; 仅在质量差 ≤ Δ 的边上匹配</label>
+        <input id="rcTol" type="number" min="0" step="0.01" placeholder="例如 0.05">
+      </div>
+      <div style="flex:1;min-width:200px">
+        <label>批量填入实测质量</label>
+        <div class="rowline">
+          <input id="rcUniform" type="number" min="0" step="0.01" placeholder="对全部行填同一质量">
+          <button id="btnRcApplyUniform" class="iconbtn">填入全部</button>
+        </div>
+      </div>
+    </div>
+    <h2 style="font-size:13px;margin:6px 0 6px">现场读数(实际有管槽位, 最多 12 管)
+      <span class="small">默认按方案摆放槽位生成; 可删行/改槽; 空启用槽有管也可直接改槽号录入</span></h2>
+    <div style="max-height:300px;overflow:auto">
+      <table class="wc-table">
+        <thead><tr><th style="width:150px">实测槽位</th><th style="width:170px">实测质量(g, 0.01)</th>
+          <th>该槽方案规定</th><th></th></tr></thead>
+        <tbody id="rcRowBody"></tbody>
+      </table>
+    </div>
+    <div class="rowline" style="margin-top:8px">
+      <button id="btnRcAddRow" class="iconbtn">+ 添加读数行</button>
+      <span class="small" id="rcRowCount"></span>
+    </div>
+    <div class="rowline" style="margin-top:10px">
+      <button id="btnRcRun" class="primary">执行装管复核</button>
+      <span class="small">只读操作, 不会修改或覆盖历史方案。</span>
+    </div>
+    <div id="recheckResult" style="margin-top:6px"></div>
   </div>
 </div>
 

@@ -21,6 +21,7 @@ from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
 from .evacuation import plan_slot_evacuation
 from .loading import plan_loading_sequence
+from .onsite_check import MAX_READINGS as VERIFY_MAX_TUBES, verify_loading
 from .weighing import worst_case_u1
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -128,6 +129,20 @@ class BatchSequenceRequest(BaseModel):
 class LoadingSequenceRequest(BaseModel):
     # 装载阶段一阶不平衡量限值(g·mm), 可空; 非空时必须非负
     u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
+
+
+class OnsiteReadingIn(BaseModel):
+    # 现场实际有管的启用槽位索引(方案中存在且启用); 不得重复
+    slot: int
+    # 该槽试管实测质量(g), 精度 0.01g; 必须为正数
+    measured_mass_g: float = Field(gt=0)
+
+
+class LoadingRecheckRequest(BaseModel):
+    # 现场读数: 按启用槽录入实际有管槽位与实测质量(0.01g), 最多 12 管
+    readings: list[OnsiteReadingIn] = Field(min_length=1, max_length=VERIFY_MAX_TUBES)
+    # 统一允许偏差(g), 非负; 后端只在 |实测质量-标称质量| ≤ 偏差 的边上匹配
+    tolerance_g: float = Field(ge=0)
 
 
 class SlotEvacuationRequest(BaseModel):
@@ -480,6 +495,39 @@ def loading_sequence(plan_id: int, req: LoadingSequenceRequest) -> dict[str, Any
     plan = _row_to_plan(_load_plan_row(plan_id))
     try:
         return plan_loading_sequence(plan, u1_limit_g_mm=req.u1_limit_g_mm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/plan/{plan_id}/loading-recheck")
+def loading_recheck(plan_id: int, req: LoadingRecheckRequest) -> dict[str, Any]:
+    """对已保存方案做现场装管复核(只读): 实测质量与方案标称质量的一对一匹配。
+
+    按启用槽录入现场实际有管的槽位及对应实测质量(精度 0.01g)与统一允许
+    偏差, 后端只在 |实测质量-标称质量| ≤ 偏差 的边上做一对一匹配, 用子集
+    动态规划(2^n, n≤12)取总绝对质量差最小的完全匹配, 并枚举全部最优
+    匹配: 对每个实测槽汇总所有最优匹配中可能对应的试管——唯一且为原方案
+    槽位则判正确, 唯一但属其他方案槽位则判错槽, 存在多解则判身份不确定
+    (不得任取一解断言错放)。读数数量与方案管数不等、或偏差范围内不存在
+    完全匹配时, 返回 matchable=false 并说明原因(附最大配对数的对照匹配)。
+    复核不保存、不修改原方案。
+    """
+    # 重复槽位在复核逻辑内统一报错; 此处仅拦截 pydantic 无法表达的有限性
+    for item in req.readings:
+        if not math.isfinite(item.measured_mass_g):
+            raise HTTPException(status_code=400, detail="实测质量必须为有限数值。")
+    if not math.isfinite(req.tolerance_g):
+        raise HTTPException(status_code=400, detail="统一允许偏差必须为有限数值。")
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return verify_loading(
+            plan,
+            readings=[
+                {"slot": item.slot, "measured_mass_g": item.measured_mass_g}
+                for item in req.readings
+            ],
+            tolerance_g=req.tolerance_g,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
